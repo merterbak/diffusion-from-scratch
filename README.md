@@ -1,8 +1,6 @@
 # Diffusion From Scratch
 
-A text-to-image diffusion transformer trained with rectified flow on precomputed VAE latents.
-
-256px images → SD VAE → 32x32x4 latents → DiT → latents → VAE decode → 256px images.
+A text-to-image diffusion transformer trained with dual-stream joint attention, 2D RoPE, adaLN-Zero, and rectified flow.
 
 ![denoising](assets/landscape.gif)
 
@@ -44,8 +42,6 @@ python train.py --resume checkpoints/best.pt
 # custom settings
 python train.py --batch_size 64 --epochs 300 --data_dir data/text2img
 ```
-
-Saves checkpoints to `checkpoints/` and preview grids to `samples/`.
 
 ## Sample
 
