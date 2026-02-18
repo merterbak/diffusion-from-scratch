@@ -8,9 +8,6 @@ from model import Config, DiT
 from diffusion import RectifiedFlow
 
 
-VAE_MODEL_ID = "stabilityai/sd-vae-ft-mse"
-VAE_SCALING_FACTOR = 0.18215
-
 def load_model(checkpoint_path, device):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     config = Config(**ckpt["model_config"])
@@ -65,7 +62,7 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     model, config = load_model(args.ckpt, device)
-    vae = AutoencoderKL.from_pretrained(VAE_MODEL_ID).eval().to(device)
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").eval().to(device)
     flow = RectifiedFlow(num_steps=args.steps, device=device)
 
     text_emb, null_emb = encode_prompt(args.prompt, device)
@@ -84,7 +81,7 @@ def main():
 
     print("decoding latents with VAE...")
     with torch.no_grad():
-        images = vae.decode(latents / VAE_SCALING_FACTOR).sample
+        images = vae.decode(latents / 0.18215).sample
     samples = (images.clamp(-1, 1) + 1) / 2
 
     safe_prompt = args.prompt[:50].replace(" ", "_").replace("/", "_")

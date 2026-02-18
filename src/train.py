@@ -10,10 +10,16 @@ from diffusion import RectifiedFlow
 from model import Config as DiTConfig
 from model import DiT
 from diffusers import AutoencoderKL
+from transformers import CLIPTokenizer, CLIPTextModel
 
 
-VAE_MODEL_ID = "stabilityai/sd-vae-ft-mse"
-VAE_SCALING_FACTOR = 0.18215
+
+SAMPLE_PROMPTS = [
+    "a sunset over mountains",
+    "a snowy cabin in the woods",
+    "a waterfall in a dense jungle",
+    "a red sports car on a highway",
+]
 
 
 @dataclass
@@ -31,7 +37,6 @@ class TrainSettings:
     sample_every: int = 10
     sample_cfg: float = 4.0
     sample_steps: int = 28
-    sample_count: int = 8
     num_workers: int = 4
     patch_size: int = 2
     in_channels: int = 4
@@ -128,7 +133,7 @@ def generate_preview(
         verbose=False,
     )
 
-    decoded = vae.decode(samples / VAE_SCALING_FACTOR).sample
+    decoded = vae.decode(samples / 0.18215).sample
     images = (decoded.clamp(-1, 1) + 1) / 2
 
     grid = vutils.make_grid(images, nrow=min(prompt_bank.shape[0], 4), padding=2)
@@ -155,10 +160,11 @@ def train():
     )
 
 
-    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.fp32_precision = "tf32"
 
     os.makedirs("checkpoints", exist_ok=True)
 
+    print("loading dataset...")
     dataset = LatentTextDataset(settings.data_dir, text_dropout=settings.text_dropout)
 
     dataloader = DataLoader(
@@ -169,8 +175,26 @@ def train():
         pin_memory=True,
     )
 
-    preview_text = dataset.text_embeddings[:settings.sample_count].float()
-    null_embed = dataset.null_embedding.float()
+
+    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+    clip_model = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14").eval().to("cuda")
+
+    tokens = tokenizer(
+        SAMPLE_PROMPTS, padding="max_length", max_length=77,
+        truncation=True, return_tensors="pt",
+    ).to("cuda")
+    with torch.no_grad():
+        sample_text = clip_model(**tokens).last_hidden_state.float()
+
+    null_tokens = tokenizer(
+        "", padding="max_length", max_length=77, return_tensors="pt",
+    ).to("cuda")
+    with torch.no_grad():
+        null_embed = clip_model(**null_tokens).last_hidden_state.float()
+
+    del clip_model, tokenizer
+    torch.cuda.empty_cache()
+
 
     model_config = DiTConfig(
         patch_size=settings.patch_size,
@@ -195,7 +219,7 @@ def train():
 
     flow = RectifiedFlow(num_steps=settings.sample_steps, device="cuda")
 
-    vae = AutoencoderKL.from_pretrained(VAE_MODEL_ID).eval().to("cuda")
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").eval().to("cuda")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -301,7 +325,7 @@ def train():
                 flow=flow,
                 settings=settings,
                 epoch=epoch,
-                prompt_bank=preview_text,
+                prompt_bank=sample_text,
                 null_embed=null_embed,
                 vae=vae,
             )

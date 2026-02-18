@@ -9,10 +9,6 @@ from transformers import CLIPTokenizer, CLIPTextModel
 from tqdm import tqdm
 
 
-VAE_MODEL_ID = "stabilityai/sd-vae-ft-mse"
-VAE_SCALING_FACTOR = 0.18215
-
-
 def download_images(num_samples, img_size=256):
 
     ds = load_dataset("jackyhate/text-to-image-2M", split="train", streaming=True)
@@ -57,7 +53,7 @@ def encode_to_latents(images, vae, batch_size=16, device="cuda"):
 
         with torch.no_grad():
             latents = vae.encode(pixels).latent_dist.sample()
-            latents = latents * VAE_SCALING_FACTOR
+            latents = latents * 0.18215
 
         all_latents.append(latents.cpu())
 
@@ -100,7 +96,7 @@ def main():
     images, prompts = download_images(args.num_samples, args.img_size)
 
     print(f"\nloading VAE...")
-    vae = AutoencoderKL.from_pretrained(VAE_MODEL_ID).eval().to(device)
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").eval().to(device)
     latents = encode_to_latents(images, vae, args.batch_size, device)
     del vae, images
     if device == "cuda":
