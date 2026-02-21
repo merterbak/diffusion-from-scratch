@@ -88,7 +88,7 @@ class RMSNorm(nn.Module):
 
 
 class StepEmbedding(nn.Module):
-    
+
     def __init__(self, n_embd: int, freq_dim: int = 256):
         super().__init__()
         self.freq_dim = freq_dim
@@ -106,49 +106,57 @@ class StepEmbedding(nn.Module):
         return self.mlp(timesteps_proj.to(dtype=hidden_dtype))
 
 
-class RoPE2D(nn.Module):
+class MSRoPE2D(nn.Module):
 
     def __init__(self, head_dim: int, theta: float = 10000.0):
-
         super().__init__()
         self.head_dim = head_dim
         self.theta = theta
-        assert head_dim % 2 == 0, "head_dim must be even for 2D RoPE split"
+        assert head_dim % 2 == 0, "head_dim must be even"
         self.axis_dim = head_dim // 2
 
-    def compute_freqs(self, positions: torch.Tensor, dim: int):
-
+    def _get_freqs(self, positions: torch.Tensor, dim: int):
         assert dim % 2 == 0
-        freqs = 1.0 / torch.pow(
+        inv_freq = 1.0 / torch.pow(
             self.theta,
             torch.arange(0, dim, 2, dtype=torch.float32, device=positions.device) / dim
         )
-        angles = torch.outer(positions.float(), freqs)
+        angles = torch.outer(positions.float(), inv_freq)
         return torch.cos(angles), torch.sin(angles)
 
-    def forward(self, grid_size: int, device: torch.device):
+    def forward(self, grid_h: int, grid_w: int, text_seq_len: int, device: torch.device):
+        h_positions = torch.arange(grid_h, device=device) - grid_h // 2
+        w_positions = torch.arange(grid_w, device=device) - grid_w // 2
 
-        h_pos = torch.arange(grid_size, device=device)
-        w_pos = torch.arange(grid_size, device=device)
+        h_cos, h_sin = self._get_freqs(h_positions, self.axis_dim)
+        w_cos, w_sin = self._get_freqs(w_positions, self.axis_dim)
 
-        h_cos, h_sin = self.compute_freqs(h_pos, self.axis_dim)
-        w_cos, w_sin = self.compute_freqs(w_pos, self.axis_dim)
+        h_cos = h_cos[:, None, :].expand(grid_h, grid_w, -1)
+        h_sin = h_sin[:, None, :].expand(grid_h, grid_w, -1)
+        w_cos = w_cos[None, :, :].expand(grid_h, grid_w, -1)
+        w_sin = w_sin[None, :, :].expand(grid_h, grid_w, -1)
 
-        h_cos = h_cos[:, None, :].expand(grid_size, grid_size, -1)
-        h_sin = h_sin[:, None, :].expand(grid_size, grid_size, -1)
-        w_cos = w_cos[None, :, :].expand(grid_size, grid_size, -1)
-        w_sin = w_sin[None, :, :].expand(grid_size, grid_size, -1)
+        img_cos = torch.cat([h_cos, w_cos], dim=-1)
+        img_sin = torch.cat([h_sin, w_sin], dim=-1)
 
-        cos = torch.cat([h_cos, w_cos], dim=-1)
-        sin = torch.cat([h_sin, w_sin], dim=-1)
+        img_cos = img_cos.reshape(grid_h * grid_w, -1)
+        img_sin = img_sin.reshape(grid_h * grid_w, -1)
 
-        cos = cos.reshape(grid_size * grid_size, -1)
-        sin = sin.reshape(grid_size * grid_size, -1)
+        img_cos = img_cos.repeat_interleave(2, dim=-1)
+        img_sin = img_sin.repeat_interleave(2, dim=-1)
 
-        cos = cos.repeat_interleave(2, dim=-1)
-        sin = sin.repeat_interleave(2, dim=-1)
+        diagonal_start = max(grid_h // 2, grid_w // 2)
+        txt_positions = torch.arange(text_seq_len, device=device) + diagonal_start
 
-        return cos, sin
+        txt_axis_cos, txt_axis_sin = self._get_freqs(txt_positions, self.axis_dim)
+
+        txt_cos = torch.cat([txt_axis_cos, txt_axis_cos], dim=-1)
+        txt_sin = torch.cat([txt_axis_sin, txt_axis_sin], dim=-1)
+
+        txt_cos = txt_cos.repeat_interleave(2, dim=-1)
+        txt_sin = txt_sin.repeat_interleave(2, dim=-1)
+
+        return img_cos, img_sin, txt_cos, txt_sin
 
 
 class JointAttention(nn.Module):
@@ -178,8 +186,11 @@ class JointAttention(nn.Module):
         self,
         vis_x: torch.Tensor,
         txt_x: torch.Tensor,
-        rope_cos: Optional[torch.Tensor] = None,
-        rope_sin: Optional[torch.Tensor] = None,
+        img_rope_cos: Optional[torch.Tensor] = None,
+        img_rope_sin: Optional[torch.Tensor] = None,
+        txt_rope_cos: Optional[torch.Tensor] = None,
+        txt_rope_sin: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ):
 
         B, N_vis, C = vis_x.shape
@@ -198,15 +209,18 @@ class JointAttention(nn.Module):
         q_txt = self.txt_q_norm(q_txt)
         k_txt = self.txt_k_norm(k_txt)
 
-        if rope_cos is not None and rope_sin is not None:
-            q_vis = apply_rotary_pos_emb(q_vis, rope_cos, rope_sin)
-            k_vis = apply_rotary_pos_emb(k_vis, rope_cos, rope_sin)
+        if img_rope_cos is not None:
+            q_vis = apply_rotary_pos_emb(q_vis, img_rope_cos, img_rope_sin)
+            k_vis = apply_rotary_pos_emb(k_vis, img_rope_cos, img_rope_sin)
+        if txt_rope_cos is not None:
+            q_txt = apply_rotary_pos_emb(q_txt, txt_rope_cos, txt_rope_sin)
+            k_txt = apply_rotary_pos_emb(k_txt, txt_rope_cos, txt_rope_sin)
 
         q = torch.cat([q_txt, q_vis], dim=2)
         k = torch.cat([k_txt, k_vis], dim=2)
         v = torch.cat([v_txt, v_vis], dim=2)
 
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
 
         txt_out = attn_out[:, :, :N_txt, :]
         vis_out = attn_out[:, :, N_txt:, :]
@@ -268,8 +282,11 @@ class DualStreamBlock(nn.Module):
         vis: torch.Tensor,
         txt: torch.Tensor,
         cond: torch.Tensor,
-        rope_cos: Optional[torch.Tensor] = None,
-        rope_sin: Optional[torch.Tensor] = None,
+        img_rope_cos: Optional[torch.Tensor] = None,
+        img_rope_sin: Optional[torch.Tensor] = None,
+        txt_rope_cos: Optional[torch.Tensor] = None,
+        txt_rope_sin: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ):
         vis_mod_params = self.vis_mod(cond)
         txt_mod_params = self.txt_mod(cond)
@@ -284,7 +301,10 @@ class DualStreamBlock(nn.Module):
         txt_modulated, txt_gate1 = self.modulate(txt_normed, txt_mod1)
 
         vis_attn_out, txt_attn_out = self.attn(
-            vis_modulated, txt_modulated, rope_cos, rope_sin
+            vis_modulated, txt_modulated,
+            img_rope_cos, img_rope_sin,
+            txt_rope_cos, txt_rope_sin,
+            attn_mask,
         )
 
         vis = vis + vis_gate1 * vis_attn_out
@@ -299,7 +319,6 @@ class DualStreamBlock(nn.Module):
         txt = txt + txt_gate2 * self.txt_ff(txt_modulated)
 
         return vis, txt
-
 
 
 class AdaNorm(nn.Module):
@@ -332,7 +351,7 @@ class DiT(nn.Module):
             kernel_size=config.patch_size, stride=config.patch_size, bias=True,
         )
 
-        self.rope = RoPE2D(head_dim=config.head_dim, theta=config.rope_theta)
+        self.rope = MSRoPE2D(head_dim=config.head_dim, theta=config.rope_theta)
 
         self.step_embed = StepEmbedding(n_embd=n_embd, freq_dim=256)
 
@@ -396,6 +415,7 @@ class DiT(nn.Module):
         x: torch.Tensor,
         timestep: torch.Tensor,
         text_embeddings: torch.Tensor,
+        text_mask: Optional[torch.Tensor] = None,
     ):
         vis = self.patch_embed(x)
         vis = vis.flatten(2).transpose(1, 2)
@@ -403,17 +423,32 @@ class DiT(nn.Module):
         timestep = timestep.to(vis.dtype)
         cond = self.step_embed(timestep, vis.dtype)
 
-        rope_cos, rope_sin = self.rope(self.config.grid_size, device=x.device)
-
         txt = self.text_proj(self.text_norm(text_embeddings))
+        text_seq_len = txt.shape[1]
+
+        img_rope_cos, img_rope_sin, txt_rope_cos, txt_rope_sin = self.rope(
+            self.config.grid_size, self.config.grid_size, text_seq_len, device=x.device
+        )
+
+        attn_mask = None
+        if text_mask is not None:
+            batch_size, img_seq_len = vis.shape[:2]
+            image_ones = torch.ones(batch_size, img_seq_len, dtype=torch.bool, device=x.device)
+            joint_mask = torch.cat([text_mask, image_ones], dim=1)
+            attn_mask = torch.where(joint_mask, 0.0, float("-inf"))
+            attn_mask = attn_mask.to(dtype=vis.dtype)
+            attn_mask = attn_mask[:, None, None, :]
 
         for layer in self.layers:
             vis, txt = layer(
                 vis=vis,
                 txt=txt,
                 cond=cond,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
+                img_rope_cos=img_rope_cos,
+                img_rope_sin=img_rope_sin,
+                txt_rope_cos=txt_rope_cos,
+                txt_rope_sin=txt_rope_sin,
+                attn_mask=attn_mask,
             )
 
         vis = self.output_norm(vis, cond)
