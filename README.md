@@ -8,11 +8,15 @@ A ~258M parameter text-to-image model that generates 256x256 images from text pr
 
 ## Overview
 
-The VAE compresses a 256x256 image down to a 4x32x32 latent. Noise gets mixed in, and the model learns to predict the velocity that takes it back to the clean image. At generation time it starts from pure noise and walks back to a clean image over 28 Euler steps.
+The VAE compresses a 256x256 image down to a 4x32x32 latent. Noise gets mixed in, and the model learns to predict the velocity that takes it back to the clean image. At generation time it starts from pure noise and walks back to a clean image over 28 Euler steps. 
+
+Trained on an A100 for ~20 hours with batch size 256. Landscapes start coming together around epoch 40 (roughly 3 hours in) for this dataset. Objects and people take longer and need 100-200+ more epochs before they look recognizable.
+
 
 ![images](assets/images.png)
 
 
+Also generation quality is seed dependent because at each denoising step the model is sampling from a different region of what it has learned, and at 258M parameters trained on 200k images it hasn't learned every concept uniformly. Some seeds land on well learned regions and produce a clean image, others land on underrepresented ones and produce noise. Out of 4 images from the same prompt, expect 1 decent result and 3 blurry or incoherent ones, especially before epoch 100. Always run with --num 4 or --num 8 and pick the best one.
 
 ## Architecture
 
