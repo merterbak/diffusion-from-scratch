@@ -10,6 +10,9 @@ A ~258M parameter text-to-image model that generates 256x256 images from text pr
 
 The VAE compresses a 256x256 image down to a 4x32x32 latent. Noise gets mixed in, and the model learns to predict the velocity that takes it back to the clean image. At generation time it starts from pure noise and walks back to a clean image over 28 Euler steps.
 
+![images](assets/images.png)
+
+
 
 ## Architecture
 
