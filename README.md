@@ -26,9 +26,10 @@ The architecture is inspired by [Qwen-Image](https://arxiv.org/abs/2508.02324).
 
 Text and image tokens live in separate streams but attend to each other. Both streams get modulated by the timestep through adaLN-Zero which produces shift, scale, and gate values for each one. Q, K, and V are computed separately per stream and normalized with RMSNorm, then concatenated into a single sequence for joint attention. After that the streams split back and each one passes through its own feedforward network.
 
-- 77 text tokens + 256 image tokens = 333 token joint sequence
+- 170 text tokens + 256 image tokens = 426 token joint sequence
 - QK-RMSNorm on all Q and K projections
 - All gates start at zero so the model begins as an identity function, keeping early training stable
+- Image stream FFN uses a Conv block from [Sana](https://github.com/NVlabs/Sana) instead of a standard MLP. A depthwise 3×3 conv sits between two linear projections, and one of the two parallel paths is gated with a sigmoid. The conv gives each token awareness of its spatial neighbors, which pure attention operating on flat token sequences cannot provide.
 
 ### MSRoPE
 
@@ -82,7 +83,7 @@ Qwen-Image runs at 20B parameters with 60 layers, a 7B vision-language model for
 | **Heads / Head dim** | 24 / 128 | 12 / 64 |
 | **Hidden dim** | 3072 | 768 |
 | **Text encoder** | Qwen2.5-VL (7B) | CLIP ViT-L/14 |
-| **VAE** | 16-ch Wan-2.1 | 4-ch SD VAE |
+| **VAE** | Qwen2.5-VL (7B) | T5 (flan-t5-base) |
 | **RoPE** | 3-axis (frame, h, w) | 2-axis (h, w) |
 | **Resolution** | up to 1328px | 256px |
 
@@ -94,7 +95,7 @@ pip install -r requirements.txt
 
 ### 1. Prepare the dataset
 
-Downloads images from [text-to-image-2M](https://huggingface.co/datasets/jackyhate/text-to-image-2M) and encodes them into VAE latents and CLIP embeddings:
+Downloads images from [text-to-image-2M](https://huggingface.co/datasets/jackyhate/text-to-image-2M) and encodes them into VAE latents and T5 embeddings:
 
 ```bash
 cd src

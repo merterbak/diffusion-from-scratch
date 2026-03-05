@@ -2,6 +2,7 @@ import argparse
 import os
 import time
 from dataclasses import asdict, dataclass
+from glob import glob
 from pathlib import Path
 import torch
 import torchvision.utils as vutils
@@ -10,8 +11,7 @@ from diffusion import RectifiedFlow
 from model import Config as DiTConfig
 from model import DiT
 from diffusers import AutoencoderKL
-from transformers import CLIPTokenizer, CLIPTextModel
-
+from transformers import AutoTokenizer, T5EncoderModel
 
 
 SAMPLE_PROMPTS = [
@@ -29,15 +29,14 @@ class TrainSettings:
     epochs: int = 200
     learning_rate: float = 1e-4
     warmup_steps: int = 2000
-    grad_clip: float = 1.0
-    ema_decay: float = 0.9995
+    grad_clip: float = 0.1
+    ema_decay: float = 0.9999
     text_dropout: float = 0.1
     log_every: int = 100
-    checkpoint_every: int = 50
     sample_every: int = 10
+    checkpoint_every: int = 50
     sample_cfg: float = 4.0
     sample_steps: int = 28
-    num_workers: int = 4
     patch_size: int = 2
     in_channels: int = 4
     latent_size: int = 32
@@ -48,33 +47,47 @@ class TrainSettings:
     mlp_ratio: float = 4.0
     rope_theta: float = 10000.0
     bias: bool = True
+    max_shards: int = 20
 
 
-class LatentTextDataset(Dataset):
-    def __init__(self, data_dir: str, text_dropout: float = 0.1):
+class ShardDataset(Dataset):
+    def __init__(self, data_dir: str, max_shards: int, null_embed: torch.Tensor, text_dropout: float = 0.1):
         super().__init__()
-        root = Path(data_dir)
-        self.latents = torch.load(root / "latents.pt", map_location="cpu", weights_only=True)
-        self.text_embeddings = torch.load(root / "embeddings.pt", map_location="cpu", weights_only=True)
-        self.null_embedding = torch.load(root / "null_embed.pt", map_location="cpu", weights_only=True)
+        shard_files = sorted(glob(os.path.join(data_dir, "shard_*_latents.pt")))[:max_shards]
+        if not shard_files:
+            raise FileNotFoundError(f"no shards found in {data_dir}")
+
+        print(f"loading {len(shard_files)} shards into RAM...")
+        all_latents, all_embeddings = [], []
+        for i, path in enumerate(shard_files):
+            prefix = path.replace("_latents.pt", "")
+            print(f"  [{i+1}/{len(shard_files)}] {os.path.basename(path)}", flush=True)
+            all_latents.append(torch.load(path, weights_only=True, map_location="cpu"))
+            all_embeddings.append(torch.load(prefix + "_embeddings.pt", weights_only=True, map_location="cpu"))
+
+        self.latents = torch.cat(all_latents)
+        self.embeddings = torch.cat(all_embeddings)
+        self.null_embed = null_embed
         self.text_dropout = text_dropout
+        print(f"loaded {len(self.latents):,} samples — latents {tuple(self.latents.shape)}, embeddings {tuple(self.embeddings.shape)}")
 
     def __len__(self):
         return len(self.latents)
 
     def __getitem__(self, index: int):
         latent = self.latents[index].float()
-        text = self.text_embeddings[index].float()
+        text = self.embeddings[index].float()
 
         if torch.rand(()) < 0.5:
             latent = latent.flip(-1)
         if self.text_dropout > 0.0 and torch.rand(()) < self.text_dropout:
-            text = self.null_embedding[0].float()
+            text = self.null_embed.float()
 
         return latent, text
 
+
 @torch.no_grad()
-def update_ema_weights(ema_model: torch.nn.Module, model: torch.nn.Module, decay: float):
+def update_ema(ema_model: torch.nn.Module, model: torch.nn.Module, decay: float):
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
         ema_param.data.mul_(decay).add_(param.data, alpha=1.0 - decay)
 
@@ -91,7 +104,7 @@ def save_checkpoint(
     settings: TrainSettings,
     model_config: DiTConfig,
 ):
-    payload = {
+    torch.save({
         "model": model.state_dict(),
         "ema_model": ema_model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -101,8 +114,7 @@ def save_checkpoint(
         "best_loss": best_loss,
         "train_config": asdict(settings),
         "model_config": asdict(model_config),
-    }
-    torch.save(payload, path)
+    }, path)
 
 
 @torch.no_grad()
@@ -111,32 +123,22 @@ def generate_preview(
     flow: RectifiedFlow,
     settings: TrainSettings,
     epoch: int,
-    prompt_bank: torch.Tensor,
+    sample_text: torch.Tensor,
     null_embed: torch.Tensor,
-    vae,
+    vae: AutoencoderKL,
 ):
     ema_model.eval()
-    prompt_bank = prompt_bank.to("cuda")
-    null_embed = null_embed.to("cuda")
-
     samples = flow.sample(
         model=ema_model,
-        shape=(
-            prompt_bank.shape[0],
-            settings.in_channels,
-            settings.latent_size,
-            settings.latent_size,
-        ),
-        text_embeddings=prompt_bank,
-        null_text_embed=null_embed,
+        shape=(len(sample_text), settings.in_channels, settings.latent_size, settings.latent_size),
+        text_embeddings=sample_text.to("cuda"),
+        null_text_embed=null_embed.to("cuda"),
         cfg_scale=settings.sample_cfg,
         verbose=False,
     )
-
     decoded = vae.decode(samples / 0.18215).sample
     images = (decoded.clamp(-1, 1) + 1) / 2
-
-    grid = vutils.make_grid(images, nrow=min(prompt_bank.shape[0], 4), padding=2)
+    grid = vutils.make_grid(images, nrow=min(len(sample_text), 4), padding=2)
     os.makedirs("samples", exist_ok=True)
     output_path = Path("samples") / f"epoch_{epoch + 1:04d}.png"
     vutils.save_image(grid, output_path)
@@ -145,56 +147,51 @@ def generate_preview(
 
 def train():
     defaults = TrainSettings()
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--data_dir", type=str, default=defaults.data_dir)
     parser.add_argument("--epochs", type=int, default=defaults.epochs)
     parser.add_argument("--batch_size", type=int, default=defaults.batch_size)
+    parser.add_argument("--max_shards", type=int, default=defaults.max_shards)
     args = parser.parse_args()
 
     settings = TrainSettings(
         data_dir=args.data_dir,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        max_shards=args.max_shards,
     )
 
-
     torch.backends.cuda.matmul.fp32_precision = "tf32"
-
     os.makedirs("checkpoints", exist_ok=True)
 
-    print("loading dataset...")
-    dataset = LatentTextDataset(settings.data_dir, text_dropout=settings.text_dropout)
+    print("loading T5...")
+    tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
+    t5 = T5EncoderModel.from_pretrained("google/flan-t5-base").eval().to("cuda")
+    with torch.no_grad():
+        tokens = tokenizer(
+            SAMPLE_PROMPTS, padding="max_length", max_length=170,
+            truncation=True, return_tensors="pt",
+        ).to("cuda")
+        sample_text = t5(**tokens).last_hidden_state.float()
+        null_tokens = tokenizer("", padding="max_length", max_length=170, return_tensors="pt").to("cuda")
+        null_embed = t5(**null_tokens).last_hidden_state.float()
+    del t5, tokenizer
+    torch.cuda.empty_cache()
 
-    dataloader = DataLoader(
+    dataset = ShardDataset(
+        data_dir=settings.data_dir,
+        max_shards=settings.max_shards,
+        null_embed=null_embed.squeeze(0).cpu(),
+        text_dropout=settings.text_dropout,
+    )
+    loader = DataLoader(
         dataset,
         batch_size=settings.batch_size,
         shuffle=True,
-        num_workers=settings.num_workers,
+        num_workers=0,
         pin_memory=True,
     )
-
-
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-    clip_model = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14").eval().to("cuda")
-
-    tokens = tokenizer(
-        SAMPLE_PROMPTS, padding="max_length", max_length=77,
-        truncation=True, return_tensors="pt",
-    ).to("cuda")
-    with torch.no_grad():
-        sample_text = clip_model(**tokens).last_hidden_state.float()
-
-    null_tokens = tokenizer(
-        "", padding="max_length", max_length=77, return_tensors="pt",
-    ).to("cuda")
-    with torch.no_grad():
-        null_embed = clip_model(**null_tokens).last_hidden_state.float()
-
-    del clip_model, tokenizer
-    torch.cuda.empty_cache()
-
 
     model_config = DiTConfig(
         patch_size=settings.patch_size,
@@ -208,17 +205,15 @@ def train():
         rope_theta=settings.rope_theta,
         bias=settings.bias,
     )
-
     model = DiT(model_config).to("cuda")
     ema_model = DiT(model_config).to("cuda")
     ema_model.load_state_dict(model.state_dict())
+    print("compiling model...")
+    model = torch.compile(model)
     ema_model.eval()
-
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"parameters: {total_params:,}")
+    print(f"parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     flow = RectifiedFlow(num_steps=settings.sample_steps, device="cuda")
-
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").eval().to("cuda")
 
     optimizer = torch.optim.AdamW(
@@ -227,42 +222,32 @@ def train():
         betas=(0.9, 0.999),
         weight_decay=0.0,
     )
-    warmup_steps = settings.warmup_steps
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lr_lambda=lambda step: min((step + 1) / warmup_steps, 1.0),
+        lr_lambda=lambda step: min((step + 1) / settings.warmup_steps, 1.0),
     )
 
-    global_step = 0
-    start_epoch = 0
-    best_loss = float("inf")
+    global_step, start_epoch, best_loss = 0, 0, float("inf")
 
-    if args.resume is not None:
-        resume_path = Path(args.resume)
-        if not resume_path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {resume_path}")
-
-        checkpoint = torch.load(resume_path, map_location="cpu", weights_only=True)
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
         model.load_state_dict(checkpoint["model"])
         ema_model.load_state_dict(checkpoint.get("ema_model", checkpoint["model"]))
-        if "optimizer" in checkpoint:
-            optimizer.load_state_dict(checkpoint["optimizer"])
-        if "scheduler" in checkpoint:
-            scheduler.load_state_dict(checkpoint["scheduler"])
-
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch = int(checkpoint.get("epoch", -1)) + 1
         global_step = int(checkpoint.get("global_step", 0))
         best_loss = float(checkpoint.get("best_loss", float("inf")))
-        print(f"resumed from {resume_path} at epoch {start_epoch + 1}")
+        print(f"resumed from {args.resume} at epoch {start_epoch + 1}")
 
-    print(f"epochs: {settings.epochs} (start at {start_epoch + 1})")
+    print(f"training {len(dataset):,} samples | epochs {settings.epochs} | batch {settings.batch_size}")
 
     for epoch in range(start_epoch, settings.epochs):
         model.train()
         running_loss = 0.0
         epoch_start = time.time()
 
-        for latents, text_embeds in dataloader:
+        for latents, text_embeds in loader:
             latents = latents.to("cuda", non_blocking=True)
             text_embeds = text_embeds.to("cuda", non_blocking=True)
 
@@ -274,48 +259,47 @@ def train():
             torch.nn.utils.clip_grad_norm_(model.parameters(), settings.grad_clip)
             optimizer.step()
             scheduler.step()
-            update_ema_weights(ema_model, model, settings.ema_decay)
+            update_ema(ema_model=ema_model, model=model, decay=settings.ema_decay)
 
-            batch_loss = float(loss.item())
-            running_loss += batch_loss
+            running_loss += loss.item()
             global_step += 1
 
             if global_step % settings.log_every == 0:
                 lr = optimizer.param_groups[0]["lr"]
-                print(f"  step {global_step:7d} | loss {batch_loss:.4f} | lr {lr:.3e}")
+                print(f"  step {global_step:7d} | loss {loss.item():.4f} | lr {lr:.3e}")
 
-        avg_loss = running_loss / len(dataloader)
+        avg_loss = running_loss / len(loader)
         elapsed = time.time() - epoch_start
-        print(f"epoch {epoch + 1:3d}/{settings.epochs} | loss {avg_loss:.4f} | {elapsed:.1f}s")
+        print(f"epoch {epoch + 1:3d}/{settings.epochs} | loss {avg_loss:.4f} | lr {optimizer.param_groups[0]['lr']:.3e} | {elapsed:.1f}s")
 
         if avg_loss < best_loss:
             best_loss = avg_loss
             save_checkpoint(
-                Path("checkpoints/best.pt"),
-                model,
-                ema_model,
-                optimizer,
-                scheduler,
-                epoch,
-                global_step,
-                best_loss,
-                settings,
-                model_config,
+                path=Path("checkpoints/best.pt"),
+                model=model,
+                ema_model=ema_model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                global_step=global_step,
+                best_loss=best_loss,
+                settings=settings,
+                model_config=model_config,
             )
             print("  updated best checkpoint")
 
         if (epoch + 1) % settings.checkpoint_every == 0:
             save_checkpoint(
-                Path("checkpoints") / f"epoch_{epoch + 1}.pt",
-                model,
-                ema_model,
-                optimizer,
-                scheduler,
-                epoch,
-                global_step,
-                best_loss,
-                settings,
-                model_config,
+                path=Path(f"checkpoints/epoch_{epoch + 1}.pt"),
+                model=model,
+                ema_model=ema_model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                global_step=global_step,
+                best_loss=best_loss,
+                settings=settings,
+                model_config=model_config,
             )
             print("  saved periodic checkpoint")
 
@@ -325,25 +309,24 @@ def train():
                 flow=flow,
                 settings=settings,
                 epoch=epoch,
-                prompt_bank=sample_text,
+                sample_text=sample_text,
                 null_embed=null_embed,
                 vae=vae,
             )
 
     save_checkpoint(
-        Path("checkpoints/final.pt"),
-        model,
-        ema_model,
-        optimizer,
-        scheduler,
-        settings.epochs - 1,
-        global_step,
-        best_loss,
-        settings,
-        model_config,
+        path=Path("checkpoints/final.pt"),
+        model=model,
+        ema_model=ema_model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        epoch=settings.epochs - 1,
+        global_step=global_step,
+        best_loss=best_loss,
+        settings=settings,
+        model_config=model_config,
     )
 
 
 if __name__ == "__main__":
     train()
-

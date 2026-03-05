@@ -251,6 +251,29 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
+class ConvFFN(nn.Module):
+
+    def __init__(self, dim: int, grid_size: int, mult: float = 4.0):
+        super().__init__()
+        self.grid_size = grid_size
+        hidden = int(dim * mult)
+        self.pw_in  = nn.Conv2d(dim, hidden * 2, kernel_size=1)
+        self.dw     = nn.Conv2d(hidden * 2, hidden * 2, kernel_size=3, padding=1, groups=hidden * 2)
+        self.pw_out = nn.Conv2d(hidden, dim, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        H = W = self.grid_size
+        x = x.permute(0, 2, 1).reshape(B, C, H, W)
+        x = self.pw_in(x)
+        x = self.dw(x)
+        x, gate = x.chunk(2, dim=1)
+        x = x * F.silu(gate)
+        x = self.pw_out(x)
+        x = x.reshape(B, C, N).permute(0, 2, 1)
+        return x
+
+
 class DualStreamBlock(nn.Module):
 
     def __init__(self, config: Config):
@@ -261,7 +284,7 @@ class DualStreamBlock(nn.Module):
         self.vis_mod = nn.Sequential(nn.SiLU(), nn.Linear(n_embd, 6 * n_embd, bias=True))
         self.vis_norm1 = nn.LayerNorm(n_embd, elementwise_affine=False, eps=1e-6)
         self.vis_norm2 = nn.LayerNorm(n_embd, elementwise_affine=False, eps=1e-6)
-        self.vis_ff = FeedForward(dim=n_embd, dim_out=n_embd, mult=config.mlp_ratio)
+        self.vis_ff = ConvFFN(dim=n_embd, grid_size=config.grid_size, mult=config.mlp_ratio)
 
         self.txt_mod = nn.Sequential(nn.SiLU(), nn.Linear(n_embd, 6 * n_embd, bias=True))
         self.txt_norm1 = nn.LayerNorm(n_embd, elementwise_affine=False, eps=1e-6)

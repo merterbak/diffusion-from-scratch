@@ -32,7 +32,7 @@ class RectifiedFlow:
 
         v_pred = model(z_t, t_input, text_embeddings=text_embeddings)
 
-        loss = F.mse_loss(v_pred, velocity)
+        loss = F.mse_loss(v_pred.float(), velocity.float())
         return loss
 
     @torch.no_grad()

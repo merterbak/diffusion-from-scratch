@@ -3,40 +3,47 @@ import os
 import torch
 import torchvision.utils as vutils
 from diffusers import AutoencoderKL
-from transformers import CLIPTokenizer, CLIPTextModel
+from transformers import AutoTokenizer, T5EncoderModel
 from model import Config, DiT
 from diffusion import RectifiedFlow
 
 
+
 def load_model(checkpoint_path, device):
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    config = Config(**ckpt["model_config"])
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    config = Config(**checkpoint["model_config"])
     model = DiT(config).to(device)
-    model.load_state_dict(ckpt["ema_model"])
+    model.load_state_dict(checkpoint["ema_model"])
     model.eval()
     return model, config
 
 
 def encode_prompt(prompt, device):
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-    clip_model = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14").eval().to(device)
+    tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
+    t5_model = T5EncoderModel.from_pretrained("google/flan-t5-base").eval().to(device)
 
     tokens = tokenizer(
-        prompt, padding="max_length", max_length=77,
+        prompt, padding="max_length", max_length=170,
         truncation=True, return_tensors="pt",
     ).to(device)
 
     with torch.no_grad():
-        text_emb = clip_model(**tokens).last_hidden_state
+        text_emb = t5_model(
+            input_ids=tokens.input_ids,
+            attention_mask=tokens.attention_mask,
+        ).last_hidden_state
 
     null_tokens = tokenizer(
-        "", padding="max_length", max_length=77, return_tensors="pt",
+        "", padding="max_length", max_length=170, return_tensors="pt",
     ).to(device)
 
     with torch.no_grad():
-        null_emb = clip_model(**null_tokens).last_hidden_state
+        null_emb = t5_model(
+            input_ids=null_tokens.input_ids,
+            attention_mask=null_tokens.attention_mask,
+        ).last_hidden_state
 
-    del clip_model, tokenizer
+    del t5_model, tokenizer
     torch.cuda.empty_cache()
 
     return text_emb, null_emb
@@ -44,7 +51,7 @@ def encode_prompt(prompt, device):
 
 def main():
     parser = argparse.ArgumentParser(description="generate images")
-    parser.add_argument("--ckpt", type=str, default="checkpoints/best.pt")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/best.pt")
     parser.add_argument("--prompt", type=str, default="a beautiful landscape")
     parser.add_argument("--cfg", type=float, default=4.0)
     parser.add_argument("--num", type=int, default=4)
@@ -55,17 +62,18 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"device: {device}")
 
-    if not os.path.exists(args.ckpt):
-        print(f"checkpoint not found: {args.ckpt}")
+    if not os.path.exists(args.checkpoint):
+        print(f"checkpoint not found: {args.checkpoint}")
         return
 
     os.makedirs(args.output, exist_ok=True)
 
-    model, config = load_model(args.ckpt, device)
+    model, config = load_model(args.checkpoint, device)
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").eval().to(device)
     flow = RectifiedFlow(num_steps=args.steps, device=device)
 
-    text_emb, null_emb = encode_prompt(args.prompt, device)
+    prompt = args.prompt
+    text_emb, null_emb = encode_prompt(prompt, device)
     text_emb = text_emb.expand(args.num, -1, -1)
 
     print(f"\ngenerating {args.num} images with cfg_scale={args.cfg}, steps={args.steps}")
