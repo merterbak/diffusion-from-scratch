@@ -29,7 +29,7 @@ Text and image tokens live in separate streams but attend to each other. Both st
 - 170 text tokens + 256 image tokens = 426 token joint sequence
 - QK-RMSNorm on all Q and K projections
 - All gates start at zero so the model begins as an identity function, keeping early training stable
-- Image stream FFN uses a Conv block from [Sana](https://github.com/NVlabs/Sana) instead of a standard MLP. A depthwise 3×3 conv sits between two linear projections, and one of the two parallel paths is gated with a sigmoid. The conv gives each token awareness of its spatial neighbors, which pure attention operating on flat token sequences cannot provide.
+- Image stream FFN uses a Conv block from [SANA](https://github.com/NVlabs/Sana) instead of a standard MLP. A depthwise 3×3 conv sits between two linear projections, and one of the two parallel paths is gated with a sigmoid. The conv gives each token awareness of its spatial neighbors, which pure attention operating on flat token sequences cannot provide.
 
 ### MSRoPE
 
@@ -82,8 +82,8 @@ Qwen-Image runs at 20B parameters with 60 layers, a 7B vision-language model for
 | **Layers** | 60 | 12 |
 | **Heads / Head dim** | 24 / 128 | 12 / 64 |
 | **Hidden dim** | 3072 | 768 |
-| **Text encoder** | Qwen2.5-VL (7B) | CLIP ViT-L/14 |
-| **VAE** | Qwen2.5-VL (7B) | T5 (flan-t5-base) |
+| **Text encoder** | Qwen2.5-VL (7B) | T5 (flan-t5-base) |
+| **VAE** | 16-ch Wan-2.1 | 4-ch SD VAE |
 | **RoPE** | 3-axis (frame, h, w) | 2-axis (h, w) |
 | **Resolution** | up to 1328px | 256px |
 
